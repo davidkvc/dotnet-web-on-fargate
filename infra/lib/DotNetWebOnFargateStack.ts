@@ -76,9 +76,15 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
         apiContainer: ecs.AssetImage,
         fluentbitContainer: ecs.AssetImage
     }) {
+        const serviceLogs = new logs.LogGroup(this, `${props.appName}-ServiceLogs`, {
+            retention: logs.RetentionDays.ONE_DAY,
+            logGroupName: `/dotnet-web-on-fargate/service/${props.appName}`
+        });
+        serviceLogs.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+
         const appLogs = new logs.LogGroup(this, `${props.appName}-AppLogs`, {
             retention: logs.RetentionDays.ONE_WEEK,
-            logGroupName: `/dotnet-web-on-fargate/${props.appName}`,
+            logGroupName: `/dotnet-web-on-fargate/app/${props.appName}`,
         });
         appLogs.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
@@ -105,6 +111,12 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
         });
         taskDefinition.addToTaskRolePolicy(allowLogsManagementPolicy);
 
+        const containerLogging = ecs.LogDriver.awsLogs({
+            streamPrefix: props.appName,
+            logRetention: logs.RetentionDays.ONE_DAY,
+            logGroup: serviceLogs
+        });
+
         const nginxContainer = taskDefinition.addContainer('nginx', {
             image: props.nginxContainer,
             portMappings: [
@@ -114,10 +126,7 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
                     protocol: ecs.Protocol.TCP
                 }
             ],
-            logging: ecs.LogDriver.awsLogs({
-                streamPrefix: props.appName,
-                logRetention: logs.RetentionDays.ONE_DAY
-            }),
+            logging: containerLogging,
         });
 
         const apiContainer = taskDefinition.addContainer("api", {
@@ -130,10 +139,7 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
                     protocol: ecs.Protocol.TCP
                 }
             ],
-            logging: ecs.LogDriver.awsLogs({
-                streamPrefix: props.appName,
-                logRetention: logs.RetentionDays.ONE_DAY
-            }),
+            logging: containerLogging,
             healthCheck: {
                 command: [
                     "CMD-SHELL",
@@ -158,10 +164,7 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
 
         const logsContainer = taskDefinition.addContainer("fluentbit", {
             image: props.fluentbitContainer,
-            logging: ecs.LogDriver.awsLogs({
-                streamPrefix: props.appName,
-                logRetention: logs.RetentionDays.ONE_DAY
-            }),
+            logging: containerLogging,
             environment: {
                 REGION: this.region,
                 LOG_GROUP_NAME: appLogs.logGroupName
