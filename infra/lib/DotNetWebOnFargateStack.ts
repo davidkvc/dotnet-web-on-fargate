@@ -17,20 +17,72 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
         //aws ssm put-parameter --name /david/dotnetwebonfargate/secrets --type SecureString --value '{""password"": ""test""}' --overwrite
         const secretsParameterName = '/david/dotnetwebonfargate/secrets';
 
-        const vpc = new ec2.Vpc(this, "DotNetWebOnFargateVpc", {
+        const vpc = new ec2.Vpc(this, "Vpc", {
             //at least 2 are required by ECS
             maxAzs: 2
         });
 
-        const cluster = new ecs.Cluster(this, "DotNetWebOnFargateCluster", {
+        const cluster = new ecs.Cluster(this, "Cluster", {
             vpc: vpc,
-            //containerInsights: true
-        });
-        const cloudMapNamespace = cluster.addDefaultCloudMapNamespace({
-            name: 'dotnetwebonfargate',
+            //containerInsights: true,
+            defaultCloudMapNamespace: {
+                name: 'dotnetwebonfargate'
+            }
         });
 
-        const taskDefinition = new ecs.FargateTaskDefinition(this, "DotNetWebOnFargateTaskDefinition", {
+        const sgApp = new ec2.SecurityGroup(this, 'sg-app', {
+            vpc: vpc,
+        });
+        sgApp.connections.allowInternally(ec2.Port.tcp(80), 'internal communication');
+
+        const nginxContainer = ecs.ContainerImage.fromAsset('../app/nginx');
+        const fluentbitContainer = ecs.ContainerImage.fromAsset('../app/CustomFluentbit');
+
+        // * main and client each have it's own public load balancer
+        //      * not optimal, one domain would be optimal for multiple apps. I don't care at this point
+        //      * we could 
+        //          * share LB with appropriate routing rules
+        //          * utlize API Gateway
+        //          * make these apps completely internal and create another app with nginx only that would route traffic between services
+        // * client calls main - client's /whatever is forwarded to main's /whatever
+        // * client calls main directly, utilizing CloudMap. main's internal DNS name is main.dotnetwebonfargate
+
+        this.addWebApp({
+            appName: 'main',
+            secretsParameterName, vpc, cluster,
+            serviceSecurityGroup: sgApp,
+            nginxContainer: nginxContainer,
+            fluentbitContainer: fluentbitContainer,
+            apiContainer: ecs.ContainerImage.fromAsset('../app/DotNetWebOnFargate.Api'),
+        });
+
+        this.addWebApp({
+            appName: 'client',
+            secretsParameterName, vpc, cluster,
+            serviceSecurityGroup: sgApp,
+            nginxContainer: nginxContainer,
+            fluentbitContainer: fluentbitContainer,
+            apiContainer: ecs.ContainerImage.fromAsset('../app/DotNetWebOnFargate.Client.Api'),
+        });
+    }
+
+    addWebApp(props: {
+        appName: string,
+        secretsParameterName: string, 
+        vpc: ec2.IVpc, 
+        serviceSecurityGroup: ec2.SecurityGroup,
+        cluster: ecs.ICluster,
+        nginxContainer: ecs.AssetImage,
+        apiContainer: ecs.AssetImage,
+        fluentbitContainer: ecs.AssetImage
+    }) {
+        const appLogs = new logs.LogGroup(this, `${props.appName}-AppLogs`, {
+            retention: logs.RetentionDays.ONE_WEEK,
+            logGroupName: `/dotnet-web-on-fargate/${props.appName}`,
+        });
+        appLogs.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+
+        const taskDefinition = new ecs.FargateTaskDefinition(this, `${props.appName}-TaskDef`, {
             volumes: [
                 {
                     name: 'logs'
@@ -54,7 +106,7 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
         taskDefinition.addToTaskRolePolicy(allowLogsManagementPolicy);
 
         const nginxContainer = taskDefinition.addContainer('nginx', {
-            image: ecs.ContainerImage.fromAsset('../DotNetWebOnFargate/nginx'),
+            image: props.nginxContainer,
             portMappings: [
                 {
                     containerPort: 80,
@@ -63,13 +115,13 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
                 }
             ],
             logging: ecs.LogDriver.awsLogs({
-                streamPrefix: 'DotNetWebOnFargate.nginx',
+                streamPrefix: props.appName,
                 logRetention: logs.RetentionDays.ONE_DAY
             }),
         });
 
         const apiContainer = taskDefinition.addContainer("api", {
-            image: ecs.ContainerImage.fromAsset('../DotNetWebOnFargate/DotNetWebOnFargate.Api'),
+            image: props.apiContainer,
             portMappings: [
                 // for LB health check
                 {
@@ -79,7 +131,7 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
                 }
             ],
             logging: ecs.LogDriver.awsLogs({
-                streamPrefix: 'DotNetWebOnFargate.Api',
+                streamPrefix: props.appName,
                 logRetention: logs.RetentionDays.ONE_DAY
             }),
             healthCheck: {
@@ -100,19 +152,20 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
             "Action": [
                 "ssm:GetParameter"
             ],
-            "Resource": `arn:aws:ssm:*:*:parameter${secretsParameterName}`
+            "Resource": `arn:aws:ssm:*:*:parameter${props.secretsParameterName}`
         });
         taskDefinition.addToTaskRolePolicy(allowGetSecretsParameterPolicy);
 
         const logsContainer = taskDefinition.addContainer("fluentbit", {
-            //TODO pull from AWS internal registry
-            //aws ssm get-parameter --name /aws/service/aws-for-fluent-bit/stable
-            //image: ecs.ContainerImage.fromRegistry("public.ecr.aws/aws-observability/aws-for-fluent-bit:stable"),
-            image: ecs.ContainerImage.fromAsset('../DotNetWebOnFargate/CustomFluentbit'),
+            image: props.fluentbitContainer,
             logging: ecs.LogDriver.awsLogs({
-                streamPrefix: 'DotNetWebOnFargate.Fluentbit',
+                streamPrefix: props.appName,
                 logRetention: logs.RetentionDays.ONE_DAY
             }),
+            environment: {
+                REGION: this.region,
+                LOG_GROUP_NAME: appLogs.logGroupName
+            }
         });
         logsContainer.addMountPoints({
             containerPath: '/logs',
@@ -121,21 +174,16 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
             readOnly: false
         });
 
-        const sgApp = new ec2.SecurityGroup(this, "sg-app", {
-            vpc: vpc,
-        });
-
-        const appService = new ecs_patterns.ApplicationLoadBalancedFargateService(this, "DotNetWebOnFargateService", {
-            cluster: cluster,
+        const appService = new ecs_patterns.ApplicationLoadBalancedFargateService(this, `${props.appName}Service`, {
+            cluster: props.cluster,
             cpu: 256,
             desiredCount: 1,
             taskDefinition: taskDefinition,
             memoryLimitMiB: 512,
             publicLoadBalancer: true,
-            securityGroups: [sgApp],
+            securityGroups: [props.serviceSecurityGroup],
             cloudMapOptions: {
-                name: 'api',
-                cloudMapNamespace: cloudMapNamespace,
+                name: props.appName
             },
         });
 
@@ -152,15 +200,15 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
             path: '/_health',
             port: "81"
         });
-        appService.listener.connections.allowTo(sgApp, ec2.Port.tcp(81), "for health check");
+        appService.listener.connections.allowTo(props.serviceSecurityGroup, ec2.Port.tcp(81), "for health check");
 
-        new events.Rule(this, "RedeployOnSecretsChange", {
-            description: "Redeploy DotNetWebOnFargate on secrets config change",
+        new events.Rule(this, `${props.appName}-RedeployOnSecretsChange`, {
+            description: `Redeploy ${props.appName} on secrets config change`,
             eventPattern: {
                 source: ["aws.ssm"],
                 detailType: ["Parameter Store Change"],
                 detail: {
-                    name: [secretsParameterName],
+                    name: [props.secretsParameterName],
                     operation: [
                         "Create",
                         "Update",
@@ -175,7 +223,7 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
                     service: 'ECS',
                     action: 'updateService',
                     parameters: {
-                        cluster: cluster.clusterName,
+                        cluster: props.cluster.clusterName,
                         service: appService.service.serviceName,
                         forceNewDeployment: true
                     }
@@ -183,22 +231,16 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
             ]
         });
 
-        const appLogs = new logs.LogGroup(this, 'app-logs', {
-            retention: logs.RetentionDays.ONE_WEEK,
-            logGroupName: 'dotnet-web-on-fargate',
-        });
-        appLogs.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
-
-        const mf = appLogs.addMetricFilter('ResponseTimesMf', {
+        const mf = appLogs.addMetricFilter(`${props.appName}-ResponseTimesMf`, {
             filterPattern: logs.FilterPattern.stringValue('$.EventId.Name', '=', 'RequestFinished'),
-            metricNamespace: 'DotNetWebOnFargate',
+            metricNamespace: props.appName,
             metricName: 'response time ms',
             metricValue: '$.ElapsedMilliseconds',
         });
         mf.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
-        const dashboard = new cw.Dashboard(this, 'Dashboard', {
-            dashboardName: 'DotNetOnFargate',
+        const dashboard = new cw.Dashboard(this, `${props.appName}Dashboard`, {
+            dashboardName: props.appName,
         });
         dashboard.addWidgets(
             new cw.SingleValueWidget({
@@ -218,7 +260,7 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
         );
         dashboard.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
-        new cdk.CfnOutput(this, "ApiDocsUrl", {
+        new cdk.CfnOutput(this, `${props.appName}ApiDocsUrl`, {
             value: `http://${appService.loadBalancer.loadBalancerDnsName}/swagger`
         })
     }
