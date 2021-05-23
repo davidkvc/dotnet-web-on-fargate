@@ -1,7 +1,7 @@
 # DotNet Web App on AWS Fargate
 
 This repository contains AWS CDK project for demo ASP.Net Core 5 application
-hosted on AWS Fargate.
+hosted on AWS Fargate. It is my playground for learning AWS.
 
 Below diagram illustrates important architecture components and interactions of this project.
 > The diagram might not always be up to date with the code
