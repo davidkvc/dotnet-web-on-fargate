@@ -11,7 +11,7 @@ using Serilog.Enrichers.Span;
 using Serilog.Events;
 using Serilog.Formatting.Compact;
 
-namespace DotNetWebOnFargate.Api
+namespace DotNetWebOnFargate.Alpha.Api
 {
     public class Program
     {
@@ -35,8 +35,8 @@ namespace DotNetWebOnFargate.Api
         private static void ConfigureSerilog(HostBuilderContext ctx, LoggerConfiguration cfg)
         {
             var appInfo = new {
-                AppName = "test",
-                ComponentName = "test",
+                AppName = "dotnet-web-on-fargate",
+                ComponentName = "alpha",
                 Version = Guid.NewGuid()
             };
             

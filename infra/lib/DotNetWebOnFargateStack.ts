@@ -8,6 +8,7 @@ import * as events from "@aws-cdk/aws-events";
 import * as eventTargets from "@aws-cdk/aws-events-targets";
 import * as logs from '@aws-cdk/aws-logs';
 import * as cw from '@aws-cdk/aws-cloudwatch';
+import * as dynamo from '@aws-cdk/aws-dynamodb';
 
 export class DotNetWebOnFargateStack extends cdk.Stack {
     constructor(scope: cdk.Construct, id: string, props?: cdk.StackProps) {
@@ -27,7 +28,7 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
             //containerInsights: true,
             defaultCloudMapNamespace: {
                 name: 'dotnetwebonfargate'
-            }
+            },
         });
 
         const sgApp = new ec2.SecurityGroup(this, 'sg-app', {
@@ -47,48 +48,81 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
         // * client calls main - client's /whatever is forwarded to main's /whatever
         // * client calls main directly, utilizing CloudMap. main's internal DNS name is main.dotnetwebonfargate
 
-        this.addWebApp({
-            appName: 'main',
-            secretsParameterName, vpc, cluster,
-            serviceSecurityGroup: sgApp,
-            nginxContainer: nginxContainer,
-            fluentbitContainer: fluentbitContainer,
-            apiContainer: ecs.ContainerImage.fromAsset('../app/DotNetWebOnFargate.Api'),
+        const dashboard = new cw.Dashboard(this, `DotNetWebOnFargateDashboard`, {
+            dashboardName: 'DotNetWebOnFargate',
         });
+        dashboard.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
         this.addWebApp({
-            appName: 'client',
+            appName: 'dotnet-web-on-fargate',
+            componentName: 'alpha',
             secretsParameterName, vpc, cluster,
             serviceSecurityGroup: sgApp,
             nginxContainer: nginxContainer,
             fluentbitContainer: fluentbitContainer,
-            apiContainer: ecs.ContainerImage.fromAsset('../app/DotNetWebOnFargate.Client.Api'),
+            apiContainer: ecs.ContainerImage.fromAsset('../app/DotNetWebOnFargate.Alpha.Api'),
+            dashboard,
         });
+
+        const betaApp = this.addWebApp({
+            appName: 'dotnet-web-on-fargate',
+            componentName: 'beta',
+            secretsParameterName, vpc, cluster,
+            serviceSecurityGroup: sgApp,
+            nginxContainer: nginxContainer,
+            fluentbitContainer: fluentbitContainer,
+            apiContainer: ecs.ContainerImage.fromAsset('../app/DotNetWebOnFargate.Beta.Api'),
+            dashboard,
+        });
+
+        const table = new dynamo.Table(this, "dotnetwebonfargate", {
+            tableName: "dotnetwebonfargate",
+            billingMode: dynamo.BillingMode.PAY_PER_REQUEST,
+            partitionKey: {
+                name: 'region',
+                type: dynamo.AttributeType.STRING
+            }
+        });
+        table.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+        table.grantReadWriteData(betaApp.task.taskRole);
+
+        // this.addWebApp({
+        //     appName: 'client',
+        //     secretsParameterName, vpc, cluster,
+        //     serviceSecurityGroup: sgApp,
+        //     nginxContainer: nginxContainer,
+        //     fluentbitContainer: fluentbitContainer,
+        //     apiContainer: ecs.ContainerImage.fromAsset('../app/DotNetWebOnFargate.Client.Api'),
+        // });
     }
 
     addWebApp(props: {
         appName: string,
+        componentName: string,
         secretsParameterName: string, 
         vpc: ec2.IVpc, 
         serviceSecurityGroup: ec2.SecurityGroup,
         cluster: ecs.ICluster,
         nginxContainer: ecs.AssetImage,
         apiContainer: ecs.AssetImage,
-        fluentbitContainer: ecs.AssetImage
-    }) {
-        const serviceLogs = new logs.LogGroup(this, `${props.appName}-ServiceLogs`, {
+        fluentbitContainer: ecs.AssetImage,
+        dashboard: cw.Dashboard,
+    }): {
+        task: ecs.TaskDefinition
+    } {
+        const serviceLogs = new logs.LogGroup(this, `${props.componentName}-ServiceLogs`, {
             retention: logs.RetentionDays.ONE_DAY,
-            logGroupName: `/dotnet-web-on-fargate/service/${props.appName}`
+            logGroupName: `/dotnet-web-on-fargate/service/${props.componentName}`
         });
         serviceLogs.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
-        const appLogs = new logs.LogGroup(this, `${props.appName}-AppLogs`, {
+        const appLogs = new logs.LogGroup(this, `${props.componentName}-AppLogs`, {
             retention: logs.RetentionDays.ONE_WEEK,
-            logGroupName: `/dotnet-web-on-fargate/app/${props.appName}`,
+            logGroupName: `/dotnet-web-on-fargate/app/${props.componentName}`,
         });
         appLogs.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
-        const taskDefinition = new ecs.FargateTaskDefinition(this, `${props.appName}-TaskDef`, {
+        const taskDefinition = new ecs.FargateTaskDefinition(this, `${props.componentName}-TaskDef`, {
             volumes: [
                 {
                     name: 'logs'
@@ -105,15 +139,16 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
                 "logs:DescribeLogGroups",
                 "logs:DescribeLogStreams",
                 "logs:PutLogEvents",
-                "logs:PutRetentionPolicy"
+                "logs:PutRetentionPolicy",
+                "xray:*",
+                "ssm:GetParameters"
             ],
             "Resource": "*"
         });
         taskDefinition.addToTaskRolePolicy(allowLogsManagementPolicy);
 
         const containerLogging = ecs.LogDriver.awsLogs({
-            streamPrefix: props.appName,
-            logRetention: logs.RetentionDays.ONE_DAY,
+            streamPrefix: props.componentName,
             logGroup: serviceLogs
         });
 
@@ -144,7 +179,7 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
                 command: [
                     "CMD-SHELL",
                     "/bin/bash -c '[[ \"$(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:81/_health)\" == \"200\" ]] && exit 0 || exit 1'"
-                ]
+                ],
             },
         });
         apiContainer.addMountPoints({
@@ -177,7 +212,15 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
             readOnly: false
         });
 
-        const appService = new ecs_patterns.ApplicationLoadBalancedFargateService(this, `${props.appName}Service`, {
+        //https://aws-otel.github.io/docs/setup/ecs/task-definition-for-ecs-fargate
+        //https://github.com/aws-observability/aws-otel-collector/blob/main/config/ecs/container-insights/otel-task-metrics-config.yaml
+        const otelContainer = taskDefinition.addContainer("otel-collector", {
+            image: ecs.ContainerImage.fromRegistry("amazon/aws-otel-collector"),
+            command: ["--config=/etc/ecs/container-insights/otel-task-metrics-config.yaml"],
+            logging: containerLogging,
+        });
+
+        const appService = new ecs_patterns.ApplicationLoadBalancedFargateService(this, `${props.componentName}Service`, {
             cluster: props.cluster,
             cpu: 256,
             desiredCount: 1,
@@ -186,9 +229,12 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
             publicLoadBalancer: true,
             securityGroups: [props.serviceSecurityGroup],
             cloudMapOptions: {
-                name: props.appName
+                name: props.componentName
             },
+            //deployment completes fater but we have some downtime
+            minHealthyPercent: 0,
         });
+        appService.targetGroup.setAttribute("deregistration_delay.timeout_seconds", "5");
 
         //uncomment if you want to enable autoscaling
         // const autoScaling = appService.service.autoScaleTaskCount({
@@ -201,12 +247,15 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
         // configure LB health check
         appService.targetGroup.configureHealthCheck({
             path: '/_health',
-            port: "81"
+            port: "81",
+            healthyThresholdCount: 2,
+            interval: cdk.Duration.seconds(5),
+            timeout: cdk.Duration.seconds(4),
         });
         appService.listener.connections.allowTo(props.serviceSecurityGroup, ec2.Port.tcp(81), "for health check");
 
-        new events.Rule(this, `${props.appName}-RedeployOnSecretsChange`, {
-            description: `Redeploy ${props.appName} on secrets config change`,
+        new events.Rule(this, `${props.componentName}-RedeployOnSecretsChange`, {
+            description: `Redeploy ${props.componentName} on secrets config change`,
             eventPattern: {
                 source: ["aws.ssm"],
                 detailType: ["Parameter Store Change"],
@@ -234,37 +283,163 @@ export class DotNetWebOnFargateStack extends cdk.Stack {
             ]
         });
 
-        const mf = appLogs.addMetricFilter(`${props.appName}-ResponseTimesMf`, {
+        const responseTimeMf = appLogs.addMetricFilter(`${props.componentName}-ResponseTimeMf`, {
             filterPattern: logs.FilterPattern.stringValue('$.EventId.Name', '=', 'RequestFinished'),
             metricNamespace: props.appName,
-            metricName: 'response time ms',
+            metricName: `${props.componentName}-latency`,
             metricValue: '$.ElapsedMilliseconds',
         });
-        mf.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+        responseTimeMf.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
-        const dashboard = new cw.Dashboard(this, `${props.appName}Dashboard`, {
-            dashboardName: props.appName,
+        const requestsMf = appLogs.addMetricFilter(`${props.componentName}-RequestsMf`, {
+            filterPattern: logs.FilterPattern.stringValue('$.EventId.Name', '=', 'RequestFinished'),
+            metricNamespace: props.appName,
+            metricName: `${props.componentName}-requests`,
+            metricValue: '1',
         });
-        dashboard.addWidgets(
-            new cw.SingleValueWidget({
-                metrics: [mf.metric({
-                    statistic: 'p90.00',
-                    period: cdk.Duration.minutes(30),
-                })],
-                title: 'P90 response duration'
-            }),
-            new cw.SingleValueWidget({
-                metrics: [mf.metric({
-                    statistic: 'max',
-                    period: cdk.Duration.minutes(30),
-                })],
-                title: 'max response duration'
-            })
-        );
-        dashboard.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+        requestsMf.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
-        new cdk.CfnOutput(this, `${props.appName}ApiDocsUrl`, {
+        const errorsMf = appLogs.addMetricFilter(`${props.componentName}-ErrorsMf`, {
+            filterPattern: logs.FilterPattern.all(
+                logs.FilterPattern.stringValue('$.EventId.Name', '=', 'RequestFinished'),
+                logs.FilterPattern.numberValue('$.StatusCode', '>=', 500),
+            ),
+            metricNamespace: props.appName,
+            metricName: `${props.componentName}-errors`,
+            metricValue: '1',
+        });
+        errorsMf.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+
+        props.dashboard.addWidgets(
+            new cw.GraphWidget({
+                title: `[${props.componentName}] P90 latency`,
+
+                left: [responseTimeMf.metric({
+                    statistic: 'p90.00',
+                    period: cdk.Duration.minutes(5),
+                    unit: cw.Unit.MILLISECONDS,
+                })],
+
+                liveData: true,
+            }),
+            new cw.GraphWidget({
+                title: `[${props.componentName}] rpm`,
+
+                left: [requestsMf.metric({
+                    unit: cw.Unit.COUNT,
+                    period: cdk.Duration.minutes(1),
+                    statistic: 'n',
+                })],
+                leftYAxis: {
+                    min: 0
+                },
+
+                liveData: true,
+            }),
+            new cw.GraphWidget({
+                title: `[${props.componentName}] errors`,
+
+                left: [errorsMf.metric({
+                    unit: cw.Unit.COUNT,
+                    period: cdk.Duration.minutes(5),
+                    statistic: 'n',
+                    color: cw.Color.RED,
+                })],
+                leftYAxis: {
+                    min: 0
+                },
+
+                liveData: true,
+            }),
+            new cw.GraphWidget({
+                title: `[${props.componentName}] CPU utilization`,
+
+                width: 12,
+
+                left: [
+                    new cw.Metric({
+                        namespace: 'AWS/ECS',
+                        metricName: 'CPUUtilization',
+                        dimensions: {
+                            ServiceName: appService.service.serviceName,
+                            ClusterName: appService.cluster.clusterName
+                        },
+                        statistic: 'avg',
+                        label: 'avg CPU utilization',
+                    }),
+                    new cw.Metric({
+                        namespace: 'AWS/ECS',
+                        metricName: 'CPUUtilization',
+                        dimensions: {
+                            ServiceName: appService.service.serviceName,
+                            ClusterName: appService.cluster.clusterName
+                        },
+                        statistic: 'max',
+                        label: 'max CPU utilization',
+                    })
+                ],
+                leftYAxis: {
+                    min: 0,
+                    max: 100
+                },
+
+                liveData: true,
+            }),
+            new cw.GraphWidget({
+                title: `[${props.componentName}] MEMORY utilization`,
+
+                width: 12,
+
+                left: [
+                    new cw.Metric({
+                        namespace: 'AWS/ECS',
+                        metricName: 'MemoryUtilization',
+                        dimensions: {
+                            ServiceName: appService.service.serviceName,
+                            ClusterName: appService.cluster.clusterName
+                        },
+                        statistic: 'avg',
+                        label: 'avg MEMORY utilization',
+                    }),
+                    new cw.Metric({
+                        namespace: 'AWS/ECS',
+                        metricName: 'MemoryUtilization',
+                        dimensions: {
+                            ServiceName: appService.service.serviceName,
+                            ClusterName: appService.cluster.clusterName
+                        },
+                        statistic: 'max',
+                        label: 'max MEMORY utilization',
+                    })
+                ],
+                leftYAxis: {
+                    min: 0,
+                    max: 100
+                },
+
+                liveData: true,
+            }),
+            new cw.LogQueryWidget({
+                title: `[${props.componentName}] most recent unhandled exceptions`,
+
+                width: 24,
+
+                logGroupNames: [appLogs.logGroupName],
+                queryLines: [
+                    "fields @timestamp, @message",
+                    "filter EventId.Name = 'UnhandledException'",
+                    "sort @timestamp desc",
+                    "limit 100",
+                ]
+            }),
+        );
+
+        new cdk.CfnOutput(this, `${props.componentName}ApiDocsUrl`, {
             value: `http://${appService.loadBalancer.loadBalancerDnsName}/swagger`
         })
+
+        return {
+            task: taskDefinition
+        }
     }
 }

@@ -10,8 +10,12 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.OpenApi.Models;
+using OpenTelemetry;
+using OpenTelemetry.Contrib.Extensions.AWSXRay.Trace;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
-namespace DotNetWebOnFargate.Api
+namespace DotNetWebOnFargate.Alpha.Api
 {
     public class Startup
     {
@@ -28,7 +32,7 @@ namespace DotNetWebOnFargate.Api
             services.AddControllers();
             services.AddSwaggerGen(c =>
             {
-                c.SwaggerDoc("v1", new OpenApiInfo { Title = "DotNetWebOnFargate.Api", Version = "v1" });
+                c.SwaggerDoc("v1", new OpenApiInfo { Title = "DotNetWebOnFargate.Alpha.Api", Version = "v1" });
             });
 
             services.AddSingleton<Breaker>();
@@ -36,6 +40,33 @@ namespace DotNetWebOnFargate.Api
 
             services.AddHealthChecks()
                 .AddCheck<IsBrokenCheck>("default");
+
+            services.AddOpenTelemetryTracing(b =>
+            {
+                b
+                    .AddXRayTraceId()
+                    .AddAWSInstrumentation()
+                    .AddAspNetCoreInstrumentation(o =>
+                    {
+                        o.Filter = ctx => ctx.Request.Path != "/_health";
+                    })
+                    .AddHttpClientInstrumentation()
+                    .AddSqlClientInstrumentation(o => o.SetDbStatementForText = true)
+                    .SetResourceBuilder(ResourceBuilder.CreateDefault()
+                        .AddService("alpha", serviceNamespace: "dotnet-web-on-fargate"));
+                
+                Sdk.SetDefaultTextMapPropagator(new AWSXRayPropagator());
+
+                b.AddSource("app");
+                
+                b.AddOtlpExporter(o =>
+                {
+                    o.ExportProcessorType = ExportProcessorType.Simple;
+                    o.Endpoint = new Uri("http://localhost:4317");
+                });
+            });
+
+            services.AddHttpClient("beta", c => { c.BaseAddress = new Uri("http://beta.dotnetwebonfargate/"); });
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
@@ -45,7 +76,7 @@ namespace DotNetWebOnFargate.Api
             {
                 app.UseDeveloperExceptionPage();
                 app.UseSwagger();
-                app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "DotNetWebOnFargate.Api v1"));
+                app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "DotNetWebOnFargate.Alpha.Api v1"));
             }
 
             app.UseRouting();

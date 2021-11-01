@@ -1,4 +1,4 @@
-namespace DotNetWebOnFargate.Api 
+namespace DotNetWebOnFargate.Beta.Api 
 {
     public class Breaker
     {

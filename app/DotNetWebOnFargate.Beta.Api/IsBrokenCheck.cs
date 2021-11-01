@@ -2,7 +2,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 
-namespace DotNetWebOnFargate.Api
+namespace DotNetWebOnFargate.Beta.Api
 {
     internal class IsBrokenCheck : IHealthCheck
     {
